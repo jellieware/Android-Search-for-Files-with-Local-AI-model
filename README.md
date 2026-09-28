@@ -13,3 +13,6 @@ You must change the line to match the path/name of your local AI model. (Line 21
 ### Usage:
 <br><br>
 python Search.py Find all photos from the last year
+<br><br>
+<img width="720" height="1604" alt="1000104566" src="https://github.com/user-attachments/assets/0d0d54ee-ca99-406d-b8ad-e9d20ca3f649" />
+
