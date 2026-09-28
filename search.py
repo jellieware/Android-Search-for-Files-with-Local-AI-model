@@ -36,7 +36,16 @@ MAX_PRINT_RESULTS = None
 # Set to False to disable ANSI color output.
 HIGHLIGHT_KEYWORDS_RED = True
 RED = "\033[31m"
+
+# Print each file's modification date next to the search result.
+# Set to False to disable the blue modification-date output.
+SHOW_MODIFICATION_DATE = True
+BLUE = "\033[34m"
 RESET_COLOR = "\033[0m"
+
+# Modification-date display format.
+# Examples: "2026-09-28 15:42:10"
+MODIFICATION_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 SYSTEM_PROMPT = """You are an intelligent Android file search assistant. 
@@ -971,7 +980,30 @@ def execute_search_job(searcher: LiteRTFileSearch, query: str):
         )
 
     for filepath in results_to_print:
-        print(f"  └─ {highlight_keywords(filepath)}")
+        display_path = highlight_keywords(filepath)
+
+        if SHOW_MODIFICATION_DATE:
+            try:
+                modification_time = datetime.fromtimestamp(
+                    filepath.stat().st_mtime
+                )
+                modification_date = modification_time.strftime(
+                    MODIFICATION_DATE_FORMAT
+                )
+                # Print the modification date on its own line BEFORE the result.
+                display_date = (
+                    BLUE
+                    + f"[modified: {modification_date}]"
+                    + RESET_COLOR
+                )
+                print(f"  {display_date}")
+                print(f"  └─ {display_path}")
+            except OSError:
+                # If the file disappears or cannot be stat'ed after the search,
+                # still print the result rather than failing the entire search.
+                print(f"  └─ {display_path}")
+        else:
+            print(f"  └─ {display_path}")
 
     if MAX_PRINT_RESULTS is not None and len(results) > len(results_to_print):
         print(f"  ... and {len(results) - len(results_to_print)} more.")
