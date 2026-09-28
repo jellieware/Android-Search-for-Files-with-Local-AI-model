@@ -20,5 +20,5 @@ python search.py
 <br><br>
 Try not to use words like: ago, keyword, old, etc.. if you do, or you see a word has been added to "keywords" simply dont use it, and rephrase the question without that word.
 <br><br>
-<img width="720" height="1604" alt="1000104566" src="https://github.com/user-attachments/assets/0d0d54ee-ca99-406d-b8ad-e9d20ca3f649" />
+<img width="720" height="1604" alt="1000104570" src="https://github.com/user-attachments/assets/d8a5c2cb-3680-4d17-8cf2-f990d7184b4f" />
 
