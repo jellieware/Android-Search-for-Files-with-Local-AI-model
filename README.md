@@ -8,7 +8,7 @@ pip install litert-lm-api
 <br><br>
 ### Edit the search.py file (1 line)
 <br><br>
-You must change the line to match the path/name of your local AI model. (Line )
+You must change the line to match the path/name of your local AI model. (Line 21)
 <br><br>
 ### Usage:
 <br><br>
