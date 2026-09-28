@@ -27,6 +27,16 @@ DEFAULT_MODEL_PATH = os.getenv(
 #   export LITERT_CLI_PATH=$HOME/bin/litert_lm_main
 LITERT_CLI_BINARY = os.getenv("LITERT_CLI_PATH", "litert-lm")
 
+# Maximum number of matching files to PRINT.
+# None = unlimited (print every matching result).
+# Set to an integer such as 100, 500, or 1000 to limit printed results.
+MAX_PRINT_RESULTS = None
+
+# Highlight matched filename keywords in red when printing results.
+# Set to False to disable ANSI color output.
+HIGHLIGHT_KEYWORDS_RED = True
+RED = "\033[31m"
+RESET_COLOR = "\033[0m"
 
 
 SYSTEM_PROMPT = """You are an intelligent Android file search assistant. 
@@ -44,12 +54,14 @@ JSON Schema Output Required:
 {
   "explanation": "Short 1-sentence explanation of what you understood",
   "target_storage": "internal" | "external" | "all",
-  "directories": ["folder1", "folder2"],
+  "directories": [],
   "extensions": ["ext1", "ext2"],
   "keywords": ["word1", "word2"],
   "max_days_old": integer or null,
   "min_days_old": integer or null
 }
+
+IMPORTANT: Directory searching is NOT supported. Always return "directories": [] and NEVER use folder names such as Download, DCIM, Music, Pictures, Documents, Movies, etc. as search filters. File categories must be represented ONLY by extensions.
 
 Output strictly valid JSON inside ```json ... ``` blocks. No extra conversation."""
 
@@ -208,6 +220,23 @@ class LiteRTFileSearch:
         return ""
 
     def parse_query_with_llm(self, query: str) -> dict:
+        """
+        Parse the user's request with the local LiteRT-LM model, then apply
+        a deterministic local safety/type layer before searching.
+
+        LiteRT-LM is used for natural-language intent (for example:
+          "pictures of my dog from last week" -> keyword="dog" + recent date)
+
+        The local extension/category map is authoritative for file types.
+        This prevents the model from turning "photos" into an unrestricted
+        search or inventing directory filters.
+        """
+        q = query.lower().strip()
+
+        # First obtain the local deterministic interpretation.  This is also
+        # the safety net if LiteRT-LM is unavailable or returns bad JSON.
+        local = self._heuristic_fallback(query)
+
         prompt = (
             "<start_of_turn>system\n"
             + SYSTEM_PROMPT
@@ -219,23 +248,145 @@ class LiteRTFileSearch:
         )
 
         raw_output = self._run_via_cli(prompt)
+        model_params = None
 
         if raw_output:
-            # Models sometimes add markdown or explanatory text around JSON.
             json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
             if json_match:
                 try:
-                    cleaned_json = json_match.group(0)
-                    cleaned_json = re.sub(r',\s*([}\]])', r'\1', cleaned_json)
+                    cleaned_json = re.sub(
+                        r',\s*([}\]])', r'\1', json_match.group(0)
+                    )
                     parsed = json.loads(cleaned_json)
-
                     if isinstance(parsed, dict):
-                        return self._normalize_params(parsed)
-                except json.JSONDecodeError:
-                    pass
+                        model_params = self._normalize_params(parsed)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    model_params = None
 
-        print("[+] Using offline natural-language parser.")
-        return self._heuristic_fallback(query)
+        if model_params is None:
+            print("[+] Using offline local natural-language parser.")
+            return local
+
+        # ------------------------------------------------------------------
+        # Merge LOCAL AI intent with the deterministic file-type layer.
+        # LiteRT-LM remains responsible for natural-language understanding,
+        # while the local extension map decides what files a category means.
+        # ------------------------------------------------------------------
+        result = dict(local)
+        result["directories"] = []
+
+        # Preserve useful semantic information from the local model for
+        # storage/date intent, but never allow model directories.
+        result["target_storage"] = model_params.get(
+            "target_storage", local.get("target_storage", "all")
+        )
+
+        if model_params.get("max_days_old") is not None:
+            result["max_days_old"] = model_params["max_days_old"]
+        if model_params.get("min_days_old") is not None:
+            result["min_days_old"] = model_params["min_days_old"]
+
+        # Filename-only searches are special: they intentionally search every
+        # extension.  "name cook" must NOT become a photo/document search.
+        filename_only = self._is_filename_only_query(query)
+
+        if filename_only:
+            result["extensions"] = []
+            result["keywords"] = self._extract_filename_terms(query)
+            result["explanation"] = (
+                "Local AI natural-language search: all file types; "
+                "filename words: " + ", ".join(result["keywords"])
+                if result["keywords"]
+                else "Local AI natural-language search: all file types"
+            )
+            return result
+
+        # A category/type query MUST retain the complete local extension list.
+        # Never replace it with model output.
+        if local.get("extensions"):
+            result["extensions"] = list(local["extensions"])
+
+        # Use model keywords only when they are genuine filename terms.
+        # Remove category/type vocabulary so "find photos" cannot become
+        # keywords=["photos"], and do not combine every word in the sentence.
+        local_keywords = set(local.get("keywords", []))
+        model_keywords = []
+        for word in model_params.get("keywords", []):
+            word = str(word).lower().strip(" ._-")
+            if not word or word in local_keywords:
+                continue
+            if word in {"photos", "photo", "pictures", "picture", "images",
+                        "image", "videos", "video", "movies", "movie",
+                        "audio", "music", "songs", "song", "documents",
+                        "document", "docs", "doc", "archives", "archive",
+                        "apps", "app", "files", "file"}:
+                continue
+            model_keywords.append(word)
+
+        # The local parser is conservative.  If it found a meaningful filename
+        # term, keep it. Otherwise accept only model-provided semantic keywords.
+        if local_keywords:
+            result["keywords"] = list(local.get("keywords", []))
+        else:
+            result["keywords"] = list(dict.fromkeys(model_keywords))
+
+        result["directories"] = []
+        result["explanation"] = (
+            "Local AI natural-language search"
+            + (": file types: " + ", ".join(result["extensions"])
+               if result.get("extensions") else ": all file types")
+            + ("; filename words: " + ", ".join(result["keywords"])
+               if result.get("keywords") else "")
+        )
+
+        return result
+
+    @staticmethod
+    def _extract_filename_terms(query: str) -> list:
+        """Extract only the actual filename/title terms from a filename query."""
+        words = re.findall(r"\b[a-zA-Z0-9][a-zA-Z0-9_.-]*\b", query.lower())
+        stop = {
+            "all", "every", "file", "files", "with", "the", "name", "title",
+            "named", "called", "titled", "find", "search", "for", "show",
+            "get", "list", "me", "please", "by", "of"
+        }
+        return list(dict.fromkeys(
+            w for w in words
+            if w not in stop and not w.isdigit()
+        ))
+
+    @staticmethod
+    def _is_filename_only_query(query: str) -> bool:
+        """Return True when the user asks to search by filename/title only.
+
+        A filename/title-only search intentionally has NO extension restriction,
+        so it searches every known and unknown file extension.
+        """
+        q = query.lower().strip()
+
+        # Examples:
+        #   all files with name cook
+        #   find all files with title cook
+        #   files with title "cook"
+        #   find all files named cook
+        #   search for files called cook
+        #   files titled cook
+        file_phrase = r"\bfiles?\b"
+        name_word = r"\b(?:name|title)\b"
+        named_word = r"\b(?:named|called|titled)\b"
+
+        # IMPORTANT: only treat the request as filename-only when the word
+        # "file(s)" is explicitly part of the filename phrase.  A query such
+        # as "find photos named cook" or "find videos with name movie" is a
+        # CATEGORY + FILENAME search and must keep the photo/video extensions.
+        return (
+            bool(re.search(r"\b(?:all|every)\s+files?\b", q))
+            and bool(re.search(name_word, q))
+        ) or bool(
+            re.search(file_phrase + r"\s+(?:with\s+)?(?:the\s+)?" + name_word, q)
+        ) or bool(
+            re.search(file_phrase + r"\s+" + named_word, q)
+        )
 
     def _normalize_params(self, params: dict) -> dict:
         """Make LLM output safe and predictable for the file-search engine."""
@@ -283,6 +434,21 @@ class LiteRTFileSearch:
         """
         q = query.lower().strip()
 
+        # A filename/title-only search (e.g. "all files with name cook" or "find all files with title cook")
+        # searches every extension. It is intentionally NOT an extension search.
+        filename_only_search = self._is_filename_only_query(query)
+
+        # An empty quoted filename means "do not filter by filename".
+        # This also handles queries such as:
+        #   all files with name ""
+        #   files named ""
+        #   find all files with name ''
+        #   search for all files
+        empty_name_search = bool(
+            re.search(r'\\\\bname\\s*(?:=|is|called|named)?\\s*(?:""|\'\'\\\\\'\\\\\')', q)
+            or re.search(r'\\\\b(?:all|every)\\s+files?\\\\b', q)
+        )
+
         target_storage = "all"
         if re.search(r"\b(external|sd\s*card|memory\s*card)\b", q):
             target_storage = "external"
@@ -291,42 +457,228 @@ class LiteRTFileSearch:
 
         # Common Android file categories.
         category_map = {
-            "photos": ["jpg", "jpeg", "png", "heic", "webp"],
-            "photo": ["jpg", "jpeg", "png", "heic", "webp"],
-            "pictures": ["jpg", "jpeg", "png", "heic", "webp"],
-            "picture": ["jpg", "jpeg", "png", "heic", "webp"],
-            "images": ["jpg", "jpeg", "png", "gif", "webp", "heic"],
-            "image": ["jpg", "jpeg", "png", "gif", "webp", "heic"],
-            "videos": ["mp4", "mkv", "mov", "avi", "webm", "3gp"],
-            "video": ["mp4", "mkv", "mov", "avi", "webm", "3gp"],
-            "movies": ["mp4", "mkv", "mov", "avi", "webm"],
-            "music": ["mp3", "m4a", "wav", "flac", "ogg", "aac"],
-            "songs": ["mp3", "m4a", "wav", "flac", "ogg", "aac"],
-            "audio": ["mp3", "m4a", "wav", "flac", "ogg", "aac"],
-            "documents": ["pdf", "doc", "docx", "txt", "rtf", "odt"],
-            "document": ["pdf", "doc", "docx", "txt", "rtf", "odt"],
-            "spreadsheets": ["xls", "xlsx", "csv", "ods"],
-            "spreadsheet": ["xls", "xlsx", "csv", "ods"],
-            "archives": ["zip", "rar", "7z", "tar", "gz", "bz2"],
-            "archive": ["zip", "rar", "7z", "tar", "gz", "bz2"],
-            "apps": ["apk", "xapk"],
-            "installers": ["apk", "xapk"],
+            # Images / photos
+            "photos": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                       "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                       "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                       "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                       "ico", "svg", "svgz"],
+            "photo": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                      "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                      "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                      "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                      "ico", "svg", "svgz"],
+            "pictures": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                         "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                         "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                         "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                         "ico", "svg", "svgz"],
+            "picture": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                        "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                        "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                        "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                        "ico", "svg", "svgz"],
+            "images": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                       "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                       "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                       "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                       "ico", "svg", "svgz"],
+            "image": ["jpg", "jpeg", "jpe", "jfif", "pjpeg", "pjp", "png",
+                      "gif", "bmp", "dib", "webp", "heic", "heif", "avif",
+                      "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef",
+                      "nrw", "arw", "orf", "rw2", "raf", "srw", "pef",
+                      "ico", "svg", "svgz"],
+
+            # Video
+            "videos": ["mp4", "m4v", "mkv", "mov", "qt", "avi", "wmv",
+                       "asf", "webm", "flv", "f4v", "3gp", "3g2", "mpeg",
+                       "mpg", "mpe", "m1v", "m2v", "mts", "m2ts", "ts",
+                       "vob", "ogv", "rm", "rmvb", "divx"],
+            "video": ["mp4", "m4v", "mkv", "mov", "qt", "avi", "wmv",
+                      "asf", "webm", "flv", "f4v", "3gp", "3g2", "mpeg",
+                      "mpg", "mpe", "m1v", "m2v", "mts", "m2ts", "ts",
+                      "vob", "ogv", "rm", "rmvb", "divx"],
+            "movies": ["mp4", "m4v", "mkv", "mov", "qt", "avi", "wmv",
+                       "asf", "webm", "flv", "f4v", "mpeg", "mpg", "mts",
+                       "m2ts", "vob", "ogv", "3gp", "3g2"],
+            "movie": ["mp4", "m4v", "mkv", "mov", "qt", "avi", "wmv",
+                      "asf", "webm", "flv", "f4v", "mpeg", "mpg", "mts",
+                      "m2ts", "vob", "ogv", "3gp", "3g2"],
+
+            # Audio / music / recordings
+            "music": ["mp3", "m4a", "m4b", "m4p", "aac", "wav", "wave",
+                      "flac", "ogg", "oga", "opus", "wma", "aiff", "aif",
+                      "aifc", "alac", "ape", "amr", "3ga", "mid", "midi",
+                      "mka", "ac3", "dts", "ra", "ram"],
+            "songs": ["mp3", "m4a", "m4b", "m4p", "aac", "wav", "wave",
+                      "flac", "ogg", "oga", "opus", "wma", "aiff", "aif",
+                      "aifc", "alac", "ape", "amr", "3ga", "mid", "midi",
+                      "mka", "ac3", "dts", "ra", "ram"],
+            "song": ["mp3", "m4a", "m4b", "m4p", "aac", "wav", "wave",
+                     "flac", "ogg", "oga", "opus", "wma", "aiff", "aif",
+                     "aifc", "alac", "ape", "amr", "3ga", "mid", "midi",
+                     "mka", "ac3", "dts", "ra", "ram"],
+            "audio": ["mp3", "m4a", "m4b", "m4p", "aac", "wav", "wave",
+                      "flac", "ogg", "oga", "opus", "wma", "aiff", "aif",
+                      "aifc", "alac", "ape", "amr", "3ga", "mid", "midi",
+                      "mka", "ac3", "dts", "ra", "ram"],
+            "recordings": ["mp3", "m4a", "aac", "wav", "flac", "ogg", "opus",
+                           "amr", "3ga", "mka"],
+
+            # Documents / text
+            "documents": ["pdf", "doc", "docx", "docm", "dot", "dotx", "dotm",
+                          "txt", "text", "rtf", "odt", "ott", "pages", "md",
+                          "markdown", "tex", "latex", "epub", "mobi", "azw",
+                          "azw3", "fb2", "djvu", "xps"],
+            "document": ["pdf", "doc", "docx", "docm", "dot", "dotx", "dotm",
+                         "txt", "text", "rtf", "odt", "ott", "pages", "md",
+                         "markdown", "tex", "latex", "epub", "mobi", "azw",
+                         "azw3", "fb2", "djvu", "xps"],
+            "text": ["txt", "text", "log", "md", "markdown", "rst", "rtf",
+                     "csv", "tsv", "tex", "latex"],
+
+            # Spreadsheets / tabular data
+            "spreadsheets": ["xls", "xlsx", "xlsm", "xlsb", "xlt", "xltx",
+                             "xltm", "csv", "tsv", "ods", "ots", "numbers"],
+            "spreadsheet": ["xls", "xlsx", "xlsm", "xlsb", "xlt", "xltx",
+                            "xltm", "csv", "tsv", "ods", "ots", "numbers"],
+            "tables": ["csv", "tsv", "xls", "xlsx", "xlsm", "xlsb", "ods"],
+
+            # Presentations
+            "presentations": ["ppt", "pptx", "pptm", "pps", "ppsx", "ppsm",
+                              "pot", "potx", "potm", "odp", "otp", "key"],
+            "presentation": ["ppt", "pptx", "pptm", "pps", "ppsx", "ppsm",
+                             "pot", "potx", "potm", "odp", "otp", "key"],
+            "slides": ["ppt", "pptx", "pptm", "pps", "ppsx", "ppsm",
+                       "odp", "otp", "key"],
+
+            # Archives / compressed files
+            "archives": ["zip", "zipx", "rar", "7z", "tar", "gz", "tgz",
+                         "bz", "bz2", "tbz", "tbz2", "xz", "txz", "z",
+                         "lz", "lz4", "lzh", "cab", "arj", "ace", "iso",
+                         "img", "dmg"],
+            "archive": ["zip", "zipx", "rar", "7z", "tar", "gz", "tgz",
+                        "bz", "bz2", "tbz", "tbz2", "xz", "txz", "z",
+                        "lz", "lz4", "lzh", "cab", "arj", "ace", "iso",
+                        "img", "dmg"],
+            "compressed": ["zip", "zipx", "rar", "7z", "tar", "gz", "tgz",
+                           "bz2", "xz", "lz", "lz4", "cab", "iso"],
+
+            # Android apps / packages
+            "apps": ["apk", "xapk", "apks", "apkx", "aab"],
+            "app": ["apk", "xapk", "apks", "apkx", "aab"],
+            "installers": ["apk", "xapk", "apks", "apkx", "aab", "exe",
+                           "msi", "deb", "rpm", "dmg", "pkg"],
+            "packages": ["apk", "xapk", "apks", "aab", "deb", "rpm", "pkg"],
+
+            # Programming / source code
+            "code": ["py", "pyw", "js", "jsx", "ts", "tsx", "java", "kt",
+                     "kts", "scala", "groovy", "c", "h", "cpp", "cxx", "cc",
+                     "hpp", "cs", "swift", "m", "mm", "go", "rs", "rb",
+                     "php", "pl", "pm", "lua", "r", "dart", "ex", "exs",
+                     "erl", "hrl", "fs", "fsx", "vb", "vbs", "sh", "bash",
+                     "zsh", "fish", "ps1", "bat", "cmd", "sql", "asm",
+                     "s", "sol", "clj", "cljs", "hs", "lhs", "jl"],
+            "programming": ["py", "pyw", "js", "jsx", "ts", "tsx", "java",
+                            "kt", "kts", "c", "h", "cpp", "cxx", "cc", "hpp",
+                            "cs", "swift", "go", "rs", "rb", "php", "pl",
+                            "lua", "r", "dart", "ex", "exs", "erl", "fs",
+                            "fsx", "vb", "sh", "bash", "zsh", "ps1", "bat",
+                            "cmd", "sql", "asm", "sol", "clj", "hs", "jl"],
+            "scripts": ["py", "pyw", "js", "ts", "sh", "bash", "zsh", "fish",
+                        "ps1", "bat", "cmd", "vbs", "pl", "rb", "lua"],
+
+            # Web
+            "web": ["html", "htm", "xhtml", "css", "scss", "sass", "less",
+                    "js", "jsx", "ts", "tsx", "json", "xml", "svg", "wasm"],
+            "website": ["html", "htm", "xhtml", "css", "scss", "sass", "less",
+                        "js", "jsx", "ts", "tsx", "json", "xml", "svg"],
+            "websites": ["html", "htm", "xhtml", "css", "scss", "sass", "less",
+                         "js", "jsx", "ts", "tsx", "json", "xml", "svg"],
+
+            # Data / configuration
+            "data": ["json", "jsonl", "xml", "yaml", "yml", "toml", "ini",
+                     "cfg", "conf", "config", "csv", "tsv", "db", "sqlite",
+                     "sqlite3", "sql", "bak", "dat"],
+            "database": ["db", "sqlite", "sqlite3", "db3", "mdb", "accdb",
+                         "sql", "dump", "bak"],
+            "databases": ["db", "sqlite", "sqlite3", "db3", "mdb", "accdb",
+                          "sql", "dump", "bak"],
+            "config": ["json", "xml", "yaml", "yml", "toml", "ini", "cfg",
+                       "conf", "config", "properties", "plist", "env"],
+
+            # Fonts
+            "fonts": ["ttf", "otf", "woff", "woff2", "eot", "fon"],
+            "font": ["ttf", "otf", "woff", "woff2", "eot", "fon"],
+
+            # Subtitles / captions
+            "subtitles": ["srt", "vtt", "ass", "ssa", "sub", "idx", "sup"],
+            "subtitle": ["srt", "vtt", "ass", "ssa", "sub", "idx", "sup"],
+            "captions": ["srt", "vtt", "ass", "ssa", "sub"],
+
+            # Email
+            "email": ["eml", "msg", "emlx", "mbox", "pst", "ost"],
+            "emails": ["eml", "msg", "emlx", "mbox", "pst", "ost"],
+
+            # Certificates / keys
+            "certificates": ["pem", "crt", "cer", "der", "p7b", "p7c", "p12",
+                             "pfx"],
+            "certificates": ["pem", "crt", "cer", "der", "p7b", "p7c", "p12",
+                             "pfx"],
+            "keys": ["key", "pem", "pub", "ppk", "asc"],
+
+            # 3D / CAD
+            "3d": ["obj", "fbx", "stl", "dae", "gltf", "glb", "3ds", "blend",
+                   "ply", "step", "stp", "iges", "igs"],
+            "cad": ["dwg", "dxf", "step", "stp", "iges", "igs", "dgn"],
         }
 
         extensions = set()
 
         # Explicit extensions: "pdf files", ".jpg", "MP4s", etc.
         explicit_exts = re.findall(
-            r"(?<![a-z0-9])\.?(pdf|jpg|jpeg|png|gif|heic|webp|"
-            r"mp4|mkv|mov|avi|webm|3gp|mp3|m4a|wav|flac|ogg|aac|"
-            r"txt|doc|docx|rtf|odt|xls|xlsx|csv|ods|zip|rar|7z|tar|"
-            r"gz|bz2|apk|xapk|py|json|xml|html|css|js)(?![a-z0-9])",
+            r"(?<![a-z0-9])\.?(pdf|doc|docx|docm|dot|dotx|dotm|txt|text|rtf|"
+            r"odt|ott|pages|md|markdown|tex|epub|mobi|azw|azw3|fb2|djvu|xps|"
+            r"xls|xlsx|xlsm|xlsb|xlt|xltx|xltm|csv|tsv|ods|ots|numbers|"
+            r"ppt|pptx|pptm|pps|ppsx|ppsm|pot|potx|potm|odp|otp|key|"
+            r"jpg|jpeg|jpe|jfif|pjpeg|pjp|png|gif|bmp|dib|webp|heic|heif|"
+            r"avif|tif|tiff|raw|dng|cr2|cr3|nef|nrw|arw|orf|rw2|raf|srw|pef|"
+            r"ico|svg|svgz|mp4|m4v|mkv|mov|qt|avi|wmv|asf|webm|flv|f4v|"
+            r"3gp|3g2|mpeg|mpg|mpe|m1v|m2v|mts|m2ts|ts|vob|ogv|rm|rmvb|divx|"
+            r"mp3|m4a|m4b|m4p|aac|wav|wave|flac|ogg|oga|opus|wma|aiff|aif|"
+            r"aifc|alac|ape|amr|3ga|mid|midi|mka|ac3|dts|ra|ram|"
+            r"zip|zipx|rar|7z|tar|gz|tgz|bz|bz2|tbz|tbz2|xz|txz|z|lz|lz4|"
+            r"lzh|cab|arj|ace|iso|img|dmg|"
+            r"apk|xapk|apks|apkx|aab|exe|msi|deb|rpm|pkg|"
+            r"py|pyw|js|jsx|ts|tsx|java|kt|kts|scala|groovy|c|h|cpp|cxx|cc|"
+            r"hpp|cs|swift|m|mm|go|rs|rb|php|pl|pm|lua|r|dart|ex|exs|erl|"
+            r"hrl|fs|fsx|vb|vbs|sh|bash|zsh|fish|ps1|bat|cmd|sql|asm|s|"
+            r"sol|clj|cljs|hs|lhs|jl|"
+            r"html|htm|xhtml|css|scss|sass|less|wasm|json|jsonl|xml|yaml|"
+            r"yml|toml|ini|cfg|conf|config|properties|plist|env|db|sqlite|"
+            r"sqlite3|db3|mdb|accdb|dump|bak|dat|"
+            r"ttf|otf|woff|woff2|eot|fon|"
+            r"srt|vtt|ass|ssa|sub|idx|sup|"
+            r"eml|msg|emlx|mbox|pst|ost|"
+            r"pem|crt|cer|der|p7b|p7c|p12|pfx|pub|ppk|asc|"
+            r"obj|fbx|stl|dae|gltf|glb|3ds|blend|ply|step|stp|iges|igs|"
+            r"dwg|dxf|dgn)s?(?![a-z0-9])",
             q
         )
         extensions.update(explicit_exts)
 
+        # Common user shorthand for category names.
+        category_query = q
+        category_query = re.sub(r"\bdocs\b", "documents", category_query)
+        category_query = re.sub(r"\bdoc\b", "document", category_query)
+        category_query = re.sub(r"\bpics\b", "photos", category_query)
+        category_query = re.sub(r"\bpictures?\b", "photos", category_query)
+        category_query = re.sub(r"\bmovies?\b", "movies", category_query)
+        category_query = re.sub(r"\bsounds?\b", "audio", category_query)
+        category_query = re.sub(r"\btracks?\b", "music", category_query)
+
         for word, exts in category_map.items():
-            if re.search(r"\b" + re.escape(word) + r"\b", q):
+            if re.search(r"\b" + re.escape(word) + r"\b", category_query):
                 extensions.update(exts)
 
         # Folder names mentioned by the user are NOT search restrictions.
@@ -366,7 +718,7 @@ class LiteRTFileSearch:
         stopwords = {
             "find", "search", "show", "get", "give", "list", "locate",
             "where", "look", "looking", "for", "me", "my", "all", "any",
-            "file", "files", "named", "name", "called", "with", "that",
+            "file", "files", "named", "name", "called", "title", "titled", "with", "that",
             "have", "has", "containing", "contains", "inside", "under",
             "from", "in", "on", "at", "the", "a", "an", "of", "to",
             "and", "or", "please", "can", "you", "i", "want", "need",
@@ -384,7 +736,39 @@ class LiteRTFileSearch:
             "flac", "ogg", "aac", "txt", "doc", "docx", "rtf", "odt",
             "xls", "xlsx", "csv", "ods", "zip", "rar", "7z", "tar",
             "gz", "bz2", "apk", "xapk", "py", "json", "xml", "html",
-            "css", "js",
+            "css", "js", "jpe", "jfif", "pjpeg", "pjp", "dib", "avif",
+            "tif", "tiff", "raw", "dng", "cr2", "cr3", "nef", "nrw", "arw",
+            "orf", "rw2", "raf", "srw", "pef", "ico", "svg", "svgz", "m4v",
+            "qt", "wmv", "asf", "flv", "f4v", "3gp", "3g2", "mpeg", "mpg",
+            "mpe", "m1v", "m2v", "mts", "m2ts", "ts", "vob", "ogv", "rm",
+            "rmvb", "divx", "m4b", "m4p", "wave", "oga", "opus", "wma",
+            "aiff", "aif", "aifc", "alac", "ape", "amr", "3ga", "mid", "midi",
+            "mka", "ac3", "dts", "ra", "ram", "docm", "dot", "dotx", "dotm",
+            "ott", "pages", "md", "markdown", "tex", "latex", "epub", "mobi",
+            "azw", "azw3", "fb2", "djvu", "xps", "xlsm", "xlsb", "xlt",
+            "xltx", "xltm", "ots", "numbers", "ppt", "pptm", "pps", "ppsx",
+            "ppsm", "pot", "potx", "potm", "odp", "otp", "key", "zipx", "tgz",
+            "bz", "tbz", "tbz2", "xz", "txz", "z", "lz", "lz4", "lzh", "cab",
+            "arj", "ace", "iso", "img", "dmg", "apks", "apkx", "aab", "exe",
+            "msi", "deb", "rpm", "pkg", "pyw", "jsx", "tsx", "java", "kt",
+            "kts", "scala", "groovy", "cpp", "cxx", "cc", "hpp", "cs", "swift",
+            "mm", "go", "rs", "rb", "php", "pl", "pm", "lua", "dart", "ex",
+            "exs", "erl", "hrl", "fs", "fsx", "vb", "vbs", "sh", "bash", "zsh",
+            "fish", "ps1", "bat", "cmd", "asm", "sol", "clj", "cljs", "hs",
+            "lhs", "jl", "html", "htm", "xhtml", "scss", "sass", "less", "wasm",
+            "json", "jsonl", "yaml", "yml", "toml", "ini", "cfg", "conf",
+            "config", "properties", "plist", "env", "db", "sqlite", "sqlite3",
+            "db3", "mdb", "accdb", "dump", "bak", "dat", "ttf", "otf", "woff",
+            "woff2", "eot", "fon", "srt", "vtt", "ass", "ssa", "sub", "idx",
+            "sup", "eml", "msg", "emlx", "mbox", "pst", "ost", "pem", "crt",
+            "cer", "der", "p7b", "p7c", "p12", "pfx", "pub", "ppk", "asc",
+            "obj", "fbx", "stl", "dae", "gltf", "glb", "3ds", "blend", "ply",
+            "step", "stp", "iges", "igs", "dwg", "dxf", "dgn", "presentations",
+            "presentation", "slides", "tables", "text", "compressed", "app",
+            "packages", "code", "programming", "scripts", "web", "website",
+            "websites", "data", "database", "databases", "config", "fonts",
+            "font", "subtitles", "subtitle", "captions", "email", "emails",
+            "certificates", "keys", "3d", "cad",
         }
 
         words = re.findall(r"\b[a-zA-Z0-9][a-zA-Z0-9_.-]*\b", q)
@@ -394,7 +778,15 @@ class LiteRTFileSearch:
             clean = word.strip("._-")
             if not clean or clean in stopwords:
                 continue
-            if clean in extensions:
+            # Never treat file-type/category words as filename keywords.
+            # This includes pluralized explicit extensions such as "pdfs" and
+            # shorthand category terms such as "docs", "pics", and "sounds".
+            category_words = set(category_map.keys()) | {
+                "docs", "pics", "sounds", "tracks"
+            }
+            if clean in extensions or clean.rstrip("s") in extensions:
+                continue
+            if clean in category_words:
                 continue
             if clean.isdigit():
                 continue
@@ -406,6 +798,15 @@ class LiteRTFileSearch:
             w for w in keywords
             if not re.fullmatch(r"(last|past)\d+", w)
         ]
+
+        # For an explicit empty filename / "all files" request, there is
+        # intentionally no filename or extension restriction.
+        if empty_name_search:
+            keywords = []
+            extensions = set()
+        elif filename_only_search:
+            # Keep the filename term(s), but remove every type/category restriction.
+            extensions = set()
 
         explanation_parts = []
         if extensions:
@@ -421,6 +822,9 @@ class LiteRTFileSearch:
             explanation_parts.append(
                 f"modified within {max_days_old} day(s)"
             )
+
+        if filename_only_search and keywords:
+            explanation_parts.insert(0, "all file types")
 
         explanation = (
             "Natural-language search"
@@ -438,8 +842,15 @@ class LiteRTFileSearch:
         }
 
     def search_files(self, params: dict):
+        # Ignore any directory filters from any caller or LLM output.
+        params = dict(params)
+        params["directories"] = []
+
         target_type = params.get("target_storage", "all").lower()
-        directories = params.get("directories", [])
+
+        # Directory filtering is intentionally disabled. The search engine
+        # ONLY filters by file type (extension), filename keywords, and date.
+        # It always scans recursively from each selected storage root.
         extensions = [e.lower().lstrip('.') for e in params.get("extensions", [])]
         keywords = [k.lower() for k in params.get("keywords", [])]
         
@@ -483,8 +894,11 @@ class LiteRTFileSearch:
                     file_path = Path(root) / file
 
                     # Filter: Extensions
+                    # File-type searches are ALWAYS based on the file's actual
+                    # extension. Directory names are never considered here.
                     if extensions:
-                        if not any(file_lower.endswith(f".{ext}") for ext in extensions):
+                        file_ext = file_path.suffix.lower().lstrip(".")
+                        if file_ext not in extensions:
                             continue
 
                     # Filter: Keywords in Filename
@@ -519,11 +933,48 @@ def execute_search_job(searcher: LiteRTFileSearch, query: str):
     results = searcher.search_files(params)
 
     print(f"\n--- Found {len(results)} matching file(s) ---")
-    for filepath in results[:50]:
-        print(f"  └─ {filepath}")
 
-    if len(results) > 50:
-        print(f"  ... and {len(results) - 50} more.")
+    # Print every result by default. Set MAX_PRINT_RESULTS to an integer
+    # above if you want to limit console output.
+    if MAX_PRINT_RESULTS is None:
+        results_to_print = results
+    else:
+        results_to_print = results[:max(0, int(MAX_PRINT_RESULTS))]
+
+    def highlight_keywords(filepath):
+        """Highlight each filename-search keyword in red in the printed path."""
+        text = str(filepath)
+
+        if not HIGHLIGHT_KEYWORDS_RED:
+            return text
+
+        keywords = params.get("keywords", []) or []
+        # Longest first prevents a shorter keyword from consuming part of a
+        # longer keyword before it can be highlighted.
+        keywords = sorted(
+            {str(k) for k in keywords if str(k)},
+            key=len,
+            reverse=True,
+        )
+
+        if not keywords:
+            return text
+
+        pattern = re.compile(
+            "|".join(re.escape(keyword) for keyword in keywords),
+            re.IGNORECASE,
+        )
+
+        return pattern.sub(
+            lambda match: RED + match.group(0) + RESET_COLOR,
+            text,
+        )
+
+    for filepath in results_to_print:
+        print(f"  └─ {highlight_keywords(filepath)}")
+
+    if MAX_PRINT_RESULTS is not None and len(results) > len(results_to_print):
+        print(f"  ... and {len(results) - len(results_to_print)} more.")
 
 
 def main():
