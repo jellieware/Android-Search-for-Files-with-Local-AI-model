@@ -3,6 +3,7 @@ Find files easily on Android
 <br><br>
 ### Requirements:
 <br><br>
+Termux (App)<br>
 pkg install python<br>
 pip install litert-lm-api
 <br><br>
